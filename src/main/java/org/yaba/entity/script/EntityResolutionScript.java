@@ -5,6 +5,8 @@ import no.priv.garshol.duke.Comparator;
 import no.priv.garshol.duke.Record;
 import no.priv.garshol.duke.RecordImpl;
 import no.priv.garshol.duke.comparators.Levenshtein;
+
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.elasticsearch.ElasticsearchIllegalArgumentException;
 import org.elasticsearch.action.get.GetResponse;
 import org.elasticsearch.client.Client;
@@ -17,12 +19,17 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.index.fielddata.ScriptDocValues;
+
 import org.elasticsearch.node.Node;
 import org.elasticsearch.script.AbstractDoubleSearchScript;
 import org.elasticsearch.script.ExecutableScript;
 import org.elasticsearch.script.NativeScriptFactory;
 import org.elasticsearch.search.lookup.DocLookup;
 
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.TokenStream;
+
+import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -65,8 +72,13 @@ public final class EntityResolutionScript extends AbstractDoubleSearchScript {
      */
     private Record comparedRecord;
     /**
+     * . The query, analyzed
+     */
+    private Record queryRecord;
+    /**
      * . Script parameters
      */
+
     private Map<String, HashMap<String, Object>> entityParams;
 
     /**
@@ -101,6 +113,7 @@ public final class EntityResolutionScript extends AbstractDoubleSearchScript {
                             (ArrayList<Map<String, Object>>) params
                                     .get("fields"));
         }
+
 
     }
 
@@ -167,7 +180,8 @@ public final class EntityResolutionScript extends AbstractDoubleSearchScript {
         String result = "";
 
         if (field instanceof ScriptDocValues.Strings) {
-            result = ((ScriptDocValues.Strings) field).getValue();
+            List<String> tokens = ((ScriptDocValues.Strings) field).getValues();
+            result = concatStrings(tokens, " ");
         }
         if (field instanceof ScriptDocValues.Doubles) {
             result =
@@ -272,11 +286,15 @@ public final class EntityResolutionScript extends AbstractDoubleSearchScript {
         }
 
         double sim = comparator.compare(v1, v2);
-        if (sim < AVERAGE_SCORE) {
+        // pece
+        /*if (sim < AVERAGE_SCORE) {
             return low;
         } else {
             return ((high - AVERAGE_SCORE) * (sim * sim)) + AVERAGE_SCORE;
-        }
+        } */
+        if (sim <=0)
+            return low;
+        return ((high - AVERAGE_SCORE) * (sim * sim)) + AVERAGE_SCORE;
     }
 
     /**
@@ -436,21 +454,83 @@ public final class EntityResolutionScript extends AbstractDoubleSearchScript {
      */
     @Override
     public double runAsDouble() {
-        HashMap<String, Collection<String>> props =
-                new HashMap<>();
+        HashMap<String, Collection<String>> props = new HashMap<>();
+        HashMap<String, Collection<String>> props_query = new HashMap<>();
         DocLookup doc = doc();
-        Collection<String> docKeys = comparedRecord.getProperties();
 
+        Collection<String> docKeys = comparedRecord.getProperties();
         for (String key : docKeys) {
             if (doc.containsKey(key)) {
                 String value = getFieldValue(doc.get(key));
                 props.put(key, value == null
                         ? Collections.singleton("")
                         : Collections.singleton(value));
+
+                // this gets called for every document. Analyze the query only once.
+                if (queryRecord == null)
+                {
+                    try
+                    {
+                        Analyzer searchAnalyzer = doc.mapperService().fieldSearchAnalyzer(key);
+                        String query_analyzed = AnalyzeQueryString(searchAnalyzer, key);
+                        props_query.put(key, Collections.singleton(query_analyzed));
+                    }
+                    catch (IOException ex)
+                    {
+                        ex.printStackTrace();
+                    }
+
+                }
             }
         }
+
+        if (queryRecord == null)
+            queryRecord = new RecordImpl(props_query);
+
         Record r2 = new RecordImpl(props);
-        return compare(comparedRecord, r2, entityParams);
+
+        return compare(queryRecord, r2, entityParams);
+    }
+
+    /**
+     * . Analyze the query with the Search Analyzer for the respective field
+     *
+     * @return the tokens in a string separated by space
+     */
+    private String AnalyzeQueryString(Analyzer searchAnalyzer, String fieldName) throws IOException
+    {
+        StringBuilder sb = new StringBuilder();
+        String query = comparedRecord.getValue(fieldName);
+        TokenStream tokenStream = searchAnalyzer.tokenStream(fieldName, query);
+        try {
+            // what if the attribute is not a CharTermAttribute?
+            CharTermAttribute termAttribute = tokenStream.addAttribute(CharTermAttribute.class);
+            tokenStream.reset();
+            while (tokenStream.incrementToken()) {
+                sb.append(termAttribute.toString());
+                sb.append(" ");
+            }
+            tokenStream.end();
+        } finally {
+            tokenStream.close();
+        }
+        return sb.toString().trim();
+    }
+
+    /**
+     * . Concatenates strings using separator
+     *
+     * @return concatenated string
+     */
+
+    private static String concatStrings(List<String> strings, String separator) {
+        StringBuilder sb = new StringBuilder();
+        String sep = "";
+        for(String s: strings) {
+            sb.append(sep).append(s);
+            sep = separator;
+        }
+        return sb.toString();
     }
 
     /**
@@ -519,6 +599,7 @@ public final class EntityResolutionScript extends AbstractDoubleSearchScript {
                     cache,
                     node.client());
         }
+
 
     }
 }
